@@ -464,6 +464,7 @@ function _chartWsOpen(){
               if(panels.length)panels.forEach(p=>p.draw());
               if(PT.running)checkPaperSignal();
               if(UPT.running)checkUTBotSignalPaper();
+              if(document.getElementById('mainTabMomentum')?.classList.contains('active'))_momRedraw();
             },1000);
           }
         }else if(barTs>last.time){
@@ -474,6 +475,7 @@ function _chartWsOpen(){
           reBacktest();
           if(PT.running)checkPaperSignal();
           if(UPT.running)checkUTBotSignalPaper();
+          if(document.getElementById('mainTabMomentum')?.classList.contains('active'))_momRedraw();
         }
       }catch(e){}
     };
@@ -2208,18 +2210,6 @@ function _momRedraw(){
 const _origRenderAll=typeof renderAll==='function'?renderAll:null;
 // Hook dans le WS chartWs : on redessine aussi si l'onglet momentum est actif
 const _momCheckTab=()=>{if(document.getElementById('mainTabMomentum')?.classList.contains('active'))_momRedraw();};
-// Appeler _momCheckTab après chaque reBacktest et renderAll
-const _orig_reBacktest=reBacktest;
-// Intercept reBacktest
-window.addEventListener('load',()=>{
-  // Patch _chartWs render chain
-  const _origChkTab=_momCheckTab;
-  Object.defineProperty(window,'_chartWsRenderPending',{
-    get(){return this.__cwrp;},
-    set(v){this.__cwrp=v;if(!v)_origChkTab();},
-    configurable:true
-  });
-});
 </script>
 </body>
 </html>
