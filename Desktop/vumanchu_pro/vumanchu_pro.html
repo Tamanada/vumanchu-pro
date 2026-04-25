@@ -2035,13 +2035,13 @@ function _momInitCharts(){
   _momPriceChart=LightweightCharts.createChart(pd,{
     ..._MOM_BASE, width:pw, height:ph,
     timeScale:{..._MOM_BASE.timeScale, visible:false},
-    rightPriceScale:{..._MOM_BASE.rightPriceScale, autoScale:true},
+    rightPriceScale:{..._MOM_BASE.rightPriceScale, autoScale:true, minimumWidth:70},
   });
 
   // Indicator chart (shows time axis for both panels)
   _momIndChart=LightweightCharts.createChart(id,{
     ..._MOM_BASE, width:iw, height:ih,
-    rightPriceScale:{..._MOM_BASE.rightPriceScale, autoScale:true},
+    rightPriceScale:{..._MOM_BASE.rightPriceScale, autoScale:true, minimumWidth:70},
   });
 
   // ── Candlestick series ──
@@ -2111,11 +2111,6 @@ function _momSetIndData(candles,ind){
 
   const toD=(arr,i)=>arr[i]!==null&&!isNaN(arr[i])?{time:times[i],value:arr[i]}:null;
 
-  // Fix oscillator scale to a known range
-  const fixScale=(ser,minV,maxV)=>ser.applyOptions({
-    autoscaleInfoProvider:()=>({priceRange:{minValue:minV,maxValue:maxV},margins:{above:0.05,below:0.05}}),
-  });
-
   // Horizontal reference line
   const hLine=(ser,price,col,dashed=false,label='')=>ser.createPriceLine({
     price, color:col, lineWidth:1,
@@ -2147,7 +2142,6 @@ function _momSetIndData(candles,ind){
     dSer.setData(d.map((v,i)=>toD(d,i)).filter(Boolean));
     _momIndSers=[kSer,dSer];
     k.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
-    fixScale(kSer,0,100);
     hLine(kSer,80,'rgba(255,45,85,.55)',true,'80');
     hLine(kSer,20,'rgba(0,230,118,.55)',true,'20');
     hLine(kSer,50,'rgba(255,255,255,.15)');
@@ -2158,7 +2152,6 @@ function _momSetIndData(candles,ind){
     wrSer.setData(wr.map((v,i)=>toD(wr,i)).filter(Boolean));
     _momIndSers=[wrSer];
     wr.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
-    fixScale(wrSer,-100,0);
     hLine(wrSer,-20,'rgba(255,45,85,.55)',true,'-20');
     hLine(wrSer,-80,'rgba(0,230,118,.55)',true,'-80');
     hLine(wrSer,-50,'rgba(255,255,255,.15)');
@@ -2172,7 +2165,6 @@ function _momSetIndData(candles,ind){
     sSer.setData(rs.map((v,i)=>toD(rs,i)).filter(Boolean));
     _momIndSers=[rSer,sSer];
     r.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
-    fixScale(rSer,0,100);
     hLine(rSer,70,'rgba(255,45,85,.55)',true,'70');
     hLine(rSer,30,'rgba(0,230,118,.55)',true,'30');
     hLine(rSer,50,'rgba(255,255,255,.15)');
@@ -2194,7 +2186,21 @@ function _momSetData(candles,ind){
   });
 
   _momSetIndData(candles,ind);
-  setTimeout(_momDrawBg,50); // after LWC renders
+  setTimeout(_momDrawBg,50);       // background after LWC renders
+  setTimeout(_momSyncScales,120);  // égalise les price-scale widths → alignement parfait
+}
+
+// ── Synchronise la largeur des price scales (évite le décalage horizontal) ─────
+function _momSyncScales(){
+  if(!_momPriceChart||!_momIndChart)return;
+  try{
+    const pw=_momPriceChart.priceScale('right').width();
+    const iw=_momIndChart.priceScale('right').width();
+    const w=Math.max(pw,iw,70);
+    _momPriceChart.applyOptions({rightPriceScale:{minimumWidth:w}});
+    _momIndChart.applyOptions({rightPriceScale:{minimumWidth:w}});
+    setTimeout(_momDrawBg,20); // redessine bg après ajustement
+  }catch(e){}
 }
 
 // ── Momentum background overlay (canvas over price chart) ─────────────────────
