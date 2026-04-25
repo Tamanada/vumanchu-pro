@@ -6,6 +6,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <title>VuManChu PRO v12 — Backtest Terminal</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Orbitron:wght@700;900&display=swap');
@@ -159,7 +160,8 @@ input[type=number]::-webkit-inner-spin-button{opacity:.4}
 .mom-leg-dot{width:10px;height:3px;border-radius:1px}
 .mom-price-wrap{flex:1.6;position:relative;overflow:hidden;min-height:0;background:var(--bg0)}
 .mom-ind-wrap{flex:1;position:relative;overflow:hidden;min-height:0;background:var(--bg0);border-top:1px solid var(--border)}
-#momPriceCanvas,#momIndCanvas{position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair}
+#momPriceDiv,#momIndDiv{position:absolute;inset:0}
+#momBgCanvas{position:absolute;inset:0;pointer-events:none;z-index:10;width:100%;height:100%}
 </style>
 </head>
 <body>
@@ -364,8 +366,13 @@ input[type=number]::-webkit-inner-spin-button{opacity:.4}
         </div>
       </div>
       <div style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
-        <div class="mom-price-wrap"><canvas id="momPriceCanvas"></canvas></div>
-        <div class="mom-ind-wrap"><canvas id="momIndCanvas"></canvas></div>
+        <div class="mom-price-wrap">
+          <div id="momPriceDiv"></div>
+          <canvas id="momBgCanvas"></canvas>
+        </div>
+        <div class="mom-ind-wrap">
+          <div id="momIndDiv"></div>
+        </div>
       </div>
     </div>
     <div class="bottom" id="bottomPanel" style="display:none">
@@ -1993,222 +2000,242 @@ function _momComputeDir(candles,ind){
   return closes.map(()=>null);
 }
 
-// ── Dessin chart prix + MAs + momentum background ────────────────────────────
-function _momDrawPrice(candles,momentum){
-  const cv=document.getElementById('momPriceCanvas');
-  const wr=cv?.parentElement;
-  if(!cv||!wr||!candles.length)return;
-  const W=wr.clientWidth||900,H=wr.clientHeight||300;
-  cv.width=W;cv.height=H;
-  const ctx=cv.getContext('2d');
-  ctx.clearRect(0,0,W,H);
-  const N=candles.length;
-  const ML=62,MR=62,MT=10,MB=22;
-  const PW=W-ML-MR,PH=H-MT-MB;
+// ── MOMENTUM — Lightweight Charts ─────────────────────────────────────────────
+const _momT = ms => Math.floor(ms / 1000);
 
-  // Price range
-  let lo=Infinity,hi=-Infinity;
-  candles.forEach(c=>{if(c.low<lo)lo=c.low;if(c.high>hi)hi=c.high;});
-  const pad=(hi-lo)*0.06;lo-=pad;hi+=pad;
-  const yp=p=>MT+PH*(1-(p-lo)/(hi-lo));
-  const bw=PW/N;
-  const xc=i=>ML+(i+0.5)*bw;
+let _momPriceChart = null, _momIndChart   = null;
+let _momCandleSer  = null, _momMaSers     = [];
+let _momIndSers    = [],   _momSyncLock   = false, _momInitDone = false;
+let _momIndDataMap = new Map(); // lwcTime → first-series value (for crosshair sync)
 
-  // Momentum background per bar
-  for(let i=0;i<N;i++){
-    const m=momentum[i];
-    if(!m)continue;
-    ctx.fillStyle=m==='bull'?'rgba(0,230,118,.13)':'rgba(255,45,85,.11)';
-    ctx.fillRect(ML+i*bw,MT,bw+0.5,PH);
-  }
+const _MOM_BASE = {
+  layout:{ background:{color:'#04080f'}, textColor:'#5a7a9a',
+           fontFamily:"'IBM Plex Mono',monospace", fontSize:10 },
+  grid:{ vertLines:{color:'rgba(28,45,68,.3)'}, horzLines:{color:'rgba(28,45,68,.3)'} },
+  crosshair:{ mode:1 },
+  rightPriceScale:{ borderColor:'#1c2d44' },
+  timeScale:{ borderColor:'#1c2d44', timeVisible:true, secondsVisible:false },
+  handleScroll:true, handleScale:true,
+};
 
-  // Grid lines
-  ctx.strokeStyle='rgba(255,255,255,.04)';ctx.lineWidth=1;
-  for(let t=0;t<4;t++){const y=MT+PH*t/3;ctx.beginPath();ctx.moveTo(ML,y);ctx.lineTo(ML+PW,y);ctx.stroke();}
+function _momInitCharts(){
+  const pd=document.getElementById('momPriceDiv');
+  const id=document.getElementById('momIndDiv');
+  if(!pd||!id||typeof LightweightCharts==='undefined') return false;
 
-  // Moving averages
-  const closes=candles.map(c=>c.close);
-  const mas=[
-    {d:ema(closes,7),  col:'#ffffff',lw:2},
-    {d:ema(closes,21), col:'#00c8ff',lw:2.5},
-    {d:ema(closes,50), col:'#00e676',lw:2.5},
-    {d:ema(closes,100),col:'#ff3358',lw:2.5},
-    {d:ema(closes,200),col:'#ffcc00',lw:2.5},
-  ];
-  mas.forEach(m=>{
-    ctx.beginPath();ctx.strokeStyle=m.col;ctx.lineWidth=m.lw;ctx.setLineDash([]);
-    let s=false;
-    m.d.forEach((v,i)=>{
-      if(v===null){s=false;return;}
-      const x=xc(i),y=yp(v);
-      s?ctx.lineTo(x,y):(ctx.moveTo(x,y),s=true);
-    });
-    ctx.stroke();
+  // Destroy old instances
+  if(_momPriceChart){try{_momPriceChart.remove();}catch(e){}_momPriceChart=null;}
+  if(_momIndChart)  {try{_momIndChart.remove();}catch(e){}_momIndChart=null;}
+  _momCandleSer=null; _momMaSers=[]; _momIndSers=[]; _momIndDataMap=new Map();
+
+  const pw=pd.clientWidth||900, ph=pd.clientHeight||350;
+  const iw=id.clientWidth||900, ih=id.clientHeight||180;
+
+  // Price chart (time axis hidden — shared axis lives on indicator chart)
+  _momPriceChart=LightweightCharts.createChart(pd,{
+    ..._MOM_BASE, width:pw, height:ph,
+    timeScale:{..._MOM_BASE.timeScale, visible:false},
+    rightPriceScale:{..._MOM_BASE.rightPriceScale, autoScale:true},
   });
 
-  // Candlesticks
-  for(let i=0;i<N;i++){
-    const c=candles[i],bull=c.close>=c.open;
-    const x=xc(i),cw=Math.max(1,bw*0.65);
-    ctx.strokeStyle=bull?'#00e676':'#ff3358';
-    ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(x,yp(c.high));ctx.lineTo(x,yp(c.low));ctx.stroke();
-    const oy=yp(Math.max(c.open,c.close));
-    const ch=Math.max(1,Math.abs(yp(c.open)-yp(c.close)));
-    ctx.fillStyle=bull?'rgba(0,230,118,.85)':'rgba(255,45,85,.85)';
-    ctx.fillRect(x-cw/2,oy,cw,ch);
-  }
+  // Indicator chart (shows time axis for both panels)
+  _momIndChart=LightweightCharts.createChart(id,{
+    ..._MOM_BASE, width:iw, height:ih,
+    rightPriceScale:{..._MOM_BASE.rightPriceScale, autoScale:true},
+  });
 
-  // Y axis labels
-  ctx.font='9px IBM Plex Mono';ctx.fillStyle='rgba(184,204,224,.5)';ctx.textAlign='right';
-  const steps=5;
-  for(let t=0;t<=steps;t++){
-    const p=lo+(hi-lo)*t/steps;
-    const y=yp(p);
-    ctx.fillText(p>=1000?p.toFixed(0):p>=10?p.toFixed(1):p.toFixed(3),ML-4,y+3);
-  }
-  // Last price label
-  const last=candles[N-1].close;
-  const ly=yp(last);
-  ctx.fillStyle='rgba(0,200,255,.9)';
-  ctx.fillRect(ML+PW+1,ly-9,MR-2,18);
-  ctx.fillStyle='#050a14';ctx.textAlign='left';
-  ctx.font='bold 9px IBM Plex Mono';
-  ctx.fillText(last>=1000?last.toFixed(1):last>=10?last.toFixed(2):last.toFixed(4),ML+PW+5,ly+3);
+  // ── Candlestick series ──
+  _momCandleSer=_momPriceChart.addCandlestickSeries({
+    upColor:'#00e676', downColor:'#ff3358',
+    borderUpColor:'#00e676', borderDownColor:'#ff3358',
+    wickUpColor:'rgba(0,230,118,.7)', wickDownColor:'rgba(255,51,88,.7)',
+    priceLineVisible:true, lastValueVisible:true,
+  });
+
+  // ── MA series ──
+  const maConf=[{p:7,c:'#ffffff',w:1.5},{p:21,c:'#00c8ff',w:1.5},
+                {p:50,c:'#00e676',w:1.5},{p:100,c:'#ff3358',w:1.5},{p:200,c:'#ffcc00',w:1.5}];
+  _momMaSers=maConf.map(({p,c,w})=>({
+    period:p,
+    ser:_momPriceChart.addLineSeries({color:c,lineWidth:w,priceLineVisible:false,lastValueVisible:false}),
+  }));
+
+  // ── Crosshair sync: price → indicator ──
+  _momPriceChart.subscribeCrosshairMove(p=>{
+    if(!p.time||!_momIndSers.length){try{_momIndChart.clearCrosshairPosition();}catch(e){}return;}
+    const val=_momIndDataMap.get(p.time)??0;
+    try{_momIndChart.setCrosshairPosition(val,p.time,_momIndSers[0]);}catch(e){}
+  });
+  // ── Crosshair sync: indicator → price ──
+  _momIndChart.subscribeCrosshairMove(p=>{
+    if(!p.time||!_momCandleSer){try{_momPriceChart.clearCrosshairPosition();}catch(e){}return;}
+    try{_momPriceChart.setCrosshairPosition(0,p.time,_momCandleSer);}catch(e){}
+  });
+
+  // ── Scroll / zoom sync ──
+  _momPriceChart.timeScale().subscribeVisibleLogicalRangeChange(r=>{
+    if(_momSyncLock||!r)return; _momSyncLock=true;
+    try{_momIndChart.timeScale().setVisibleLogicalRange(r);}catch(e){}
+    _momSyncLock=false; setTimeout(_momDrawBg,20);
+  });
+  _momIndChart.timeScale().subscribeVisibleLogicalRangeChange(r=>{
+    if(_momSyncLock||!r)return; _momSyncLock=true;
+    try{_momPriceChart.timeScale().setVisibleLogicalRange(r);}catch(e){}
+    _momSyncLock=false; setTimeout(_momDrawBg,20);
+  });
+
+  // ── Resize observer ──
+  const ro=new ResizeObserver(()=>{
+    const pw2=pd.clientWidth,ph2=pd.clientHeight;
+    const iw2=id.clientWidth,ih2=id.clientHeight;
+    if(_momPriceChart&&pw2>0&&ph2>0)_momPriceChart.resize(pw2,ph2);
+    if(_momIndChart&&iw2>0&&ih2>0)_momIndChart.resize(iw2,ih2);
+    setTimeout(_momDrawBg,20);
+  });
+  ro.observe(pd); ro.observe(id);
+
+  _momInitDone=true;
+  return true;
 }
 
-// ── Dessin panneau indicateur ─────────────────────────────────────────────────
-function _momDrawInd(candles,ind){
-  const cv=document.getElementById('momIndCanvas');
-  const wr=cv?.parentElement;
-  if(!cv||!wr||!candles.length)return;
-  const W=wr.clientWidth||900,H=wr.clientHeight||150;
-  cv.width=W;cv.height=H;
-  const ctx=cv.getContext('2d');
-  ctx.clearRect(0,0,W,H);
-  const N=candles.length;
-  const ML=62,MR=62,MT=10,MB=18;
-  const PW=W-ML-MR,PH=H-MT-MB;
-  const bw=PW/N;
-  const xc=i=>ML+(i+0.5)*bw;
+// ── Indicator panel data ───────────────────────────────────────────────────────
+function _momSetIndData(candles,ind){
+  if(!_momIndChart||!candles.length)return;
+  _momIndSers.forEach(s=>{try{_momIndChart.removeSeries(s);}catch(e){}});
+  _momIndSers=[]; _momIndDataMap=new Map();
+
   const closes=candles.map(c=>c.close);
+  const highs =candles.map(c=>c.high);
+  const lows  =candles.map(c=>c.low);
+  const times =candles.map(c=>_momT(c.time));
 
-  const drawLine=(arr,col,lw=1.5,dash=[])=>{
-    ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.setLineDash(dash);
-    let s=false,_yc=null;
-    arr.forEach((v,i)=>{
-      if(v===null||isNaN(v)){s=false;return;}
-      const y=_yc(v);
-      s?ctx.lineTo(xc(i),y):(ctx.moveTo(xc(i),y),s=true);
-    });
-    ctx.stroke();ctx.setLineDash([]);
-    return _yc;
-  };
+  const toD=(arr,i)=>arr[i]!==null&&!isNaN(arr[i])?{time:times[i],value:arr[i]}:null;
 
-  const hLine=(y,col,dash=[4,4])=>{
-    ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=1;ctx.setLineDash(dash);
-    ctx.moveTo(ML,y);ctx.lineTo(ML+PW,y);ctx.stroke();ctx.setLineDash([]);
-  };
+  // Fix oscillator scale to a known range
+  const fixScale=(ser,minV,maxV)=>ser.applyOptions({
+    autoscaleInfoProvider:()=>({priceRange:{minValue:minV,maxValue:maxV},margins:{above:0.05,below:0.05}}),
+  });
 
-  const label=(txt,col,x,y)=>{ctx.font='9px IBM Plex Mono';ctx.fillStyle=col;ctx.textAlign='left';ctx.fillText(txt,x,y);};
+  // Horizontal reference line
+  const hLine=(ser,price,col,dashed=false,label='')=>ser.createPriceLine({
+    price, color:col, lineWidth:1,
+    lineStyle:dashed?2:0,         // 2 = Dashed, 0 = Solid
+    axisLabelVisible:!!label, title:label,
+  });
 
   if(ind==='macd'){
     const{macd,signal,hist}=computeMACD(closes,12,26,9);
-    let lo=0,hi=0;
-    hist.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
-    macd.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
-    const pad2=Math.max(0.001,(hi-lo)*0.1);lo-=pad2;hi+=pad2;
-    const yc=v=>MT+PH*(1-(v-lo)/(hi-lo));
-    const y0=yc(0);
-    hLine(y0,'rgba(255,255,255,.2)',[]);
-    // Histogram
-    hist.forEach((v,i)=>{if(v===null)return;const bull=v>=0;const y=yc(v);ctx.fillStyle=bull?'rgba(0,230,118,.7)':'rgba(255,45,85,.7)';const hh=Math.abs(y-y0);ctx.fillRect(ML+i*bw,Math.min(y,y0),Math.max(1,bw*0.8),Math.max(1,hh));});
-    // Lines
-    [macd,signal].forEach((arr,idx)=>{
-      const col=idx===0?'#00c8ff':'#ff9800';
-      ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=1.5;ctx.setLineDash([]);let s=false;
-      arr.forEach((v,i)=>{if(v===null){s=false;return;}const y=yc(v);s?ctx.lineTo(xc(i),y):(ctx.moveTo(xc(i),y),s=true);});
-      ctx.stroke();
-    });
-    // Labels
-    ctx.font='9px IBM Plex Mono';ctx.fillStyle='rgba(184,204,224,.6)';ctx.textAlign='right';
-    ctx.fillText((hi).toFixed(2),ML-4,MT+8);ctx.fillText((lo).toFixed(2),ML-4,MT+PH);
-    label('MACD','rgba(0,200,255,.6)',ML+4,MT+12);
-    // Current values
-    const lm=macd[N-1],ls=signal[N-1];
-    if(lm!==null){ctx.fillStyle='rgba(0,200,255,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(lm.toFixed(2),ML+PW+4,yc(lm)+3);}
-    if(ls!==null){ctx.fillStyle='rgba(255,152,0,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(ls.toFixed(2),ML+PW+4,yc(ls)+3);}
-  }
+    const histSer=_momIndChart.addHistogramSeries({color:'#00e676',priceLineVisible:false,lastValueVisible:false});
+    histSer.setData(hist.map((v,i)=>v!==null&&!isNaN(v)?{time:times[i],value:v,
+      color:v>=0?'rgba(0,230,118,.75)':'rgba(255,45,85,.75)'}:null).filter(Boolean));
+    hLine(histSer,0,'rgba(255,255,255,.25)');
 
-  if(ind==='srsi'){
+    const macdSer=_momIndChart.addLineSeries({color:'#00c8ff',lineWidth:2,priceLineVisible:false,lastValueVisible:true,title:'MACD'});
+    macdSer.setData(macd.map((v,i)=>toD(macd,i)).filter(Boolean));
+
+    const sigSer=_momIndChart.addLineSeries({color:'#ff9800',lineWidth:1.5,priceLineVisible:false,lastValueVisible:true,title:'Sig'});
+    sigSer.setData(signal.map((v,i)=>toD(signal,i)).filter(Boolean));
+
+    _momIndSers=[histSer,macdSer,sigSer];
+    macd.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
+  }
+  else if(ind==='srsi'){
     const{k,d}=computeStochRSI(closes);
-    const yc=v=>MT+PH*(1-v/100);
-    // Zones OB/OS
-    ctx.fillStyle='rgba(255,45,85,.08)';ctx.fillRect(ML,yc(80),PW,yc(100)-yc(80));
-    ctx.fillStyle='rgba(0,230,118,.08)';ctx.fillRect(ML,yc(20),PW,yc(0)-yc(20));
-    hLine(yc(80),'rgba(255,45,85,.35)');hLine(yc(20),'rgba(0,230,118,.35)');hLine(yc(50),'rgba(255,255,255,.15)',[]);
-    // Lines K & D
-    [[k,'#ffffff',2],[d,'#ff9800',1.5]].forEach(([arr,col,lw])=>{
-      ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.setLineDash([]);let s=false;
-      arr.forEach((v,i)=>{if(v===null){s=false;return;}const y=yc(v);s?ctx.lineTo(xc(i),y):(ctx.moveTo(xc(i),y),s=true);});
-      ctx.stroke();
-    });
-    label('STOCH RSI','rgba(184,204,224,.6)',ML+4,MT+12);
-    ctx.fillStyle='rgba(184,204,224,.5)';ctx.textAlign='right';ctx.font='9px IBM Plex Mono';
-    ['100','80','50','20','0'].forEach(v=>{ctx.fillText(v,ML-4,yc(parseInt(v))+3);});
-    const lk=k[N-1],ld=d[N-1];
-    if(lk!==null){ctx.fillStyle='rgba(255,255,255,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(lk.toFixed(1),ML+PW+4,yc(lk)+3);}
-    if(ld!==null){ctx.fillStyle='rgba(255,152,0,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(ld.toFixed(1),ML+PW+4,yc(ld)+3);}
+    const kSer=_momIndChart.addLineSeries({color:'#ffffff',lineWidth:2,priceLineVisible:false,lastValueVisible:true,title:'K'});
+    kSer.setData(k.map((v,i)=>toD(k,i)).filter(Boolean));
+    const dSer=_momIndChart.addLineSeries({color:'#ff9800',lineWidth:1.5,priceLineVisible:false,lastValueVisible:true,title:'D'});
+    dSer.setData(d.map((v,i)=>toD(d,i)).filter(Boolean));
+    _momIndSers=[kSer,dSer];
+    k.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
+    fixScale(kSer,0,100);
+    hLine(kSer,80,'rgba(255,45,85,.55)',true,'80');
+    hLine(kSer,20,'rgba(0,230,118,.55)',true,'20');
+    hLine(kSer,50,'rgba(255,255,255,.15)');
   }
-
-  if(ind==='willr'){
-    const highs=candles.map(c=>c.high),lows=candles.map(c=>c.low);
+  else if(ind==='willr'){
     const wr=computeWilliamsR(highs,lows,closes);
-    const yc=v=>MT+PH*(1-(v+100)/100);
-    ctx.fillStyle='rgba(255,45,85,.08)';ctx.fillRect(ML,yc(-20),PW,yc(-100)-yc(-20));
-    ctx.fillStyle='rgba(0,230,118,.08)';ctx.fillRect(ML,yc(-80),PW,yc(-100)-yc(-80));
-    hLine(yc(-20),'rgba(255,45,85,.4)');hLine(yc(-80),'rgba(0,230,118,.4)');hLine(yc(-50),'rgba(255,255,255,.15)',[]);
-    ctx.beginPath();ctx.strokeStyle='#b47cff';ctx.lineWidth=2;ctx.setLineDash([]);let s=false;
-    wr.forEach((v,i)=>{if(v===null){s=false;return;}const y=yc(v);s?ctx.lineTo(xc(i),y):(ctx.moveTo(xc(i),y),s=true);});
-    ctx.stroke();
-    label('%WILLIAMS','rgba(184,204,224,.6)',ML+4,MT+12);
-    ctx.fillStyle='rgba(184,204,224,.5)';ctx.textAlign='right';ctx.font='9px IBM Plex Mono';
-    [['0',-0],['-20',-20],['-50',-50],['-80',-80],['-100',-100]].forEach(([t,v])=>{ctx.fillText(t,ML-4,yc(v)+3);});
-    const lw2=wr[N-1];
-    if(lw2!==null){ctx.fillStyle='rgba(180,124,255,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(lw2.toFixed(1),ML+PW+4,yc(lw2)+3);}
+    const wrSer=_momIndChart.addLineSeries({color:'#b47cff',lineWidth:2,priceLineVisible:false,lastValueVisible:true,title:'%W'});
+    wrSer.setData(wr.map((v,i)=>toD(wr,i)).filter(Boolean));
+    _momIndSers=[wrSer];
+    wr.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
+    fixScale(wrSer,-100,0);
+    hLine(wrSer,-20,'rgba(255,45,85,.55)',true,'-20');
+    hLine(wrSer,-80,'rgba(0,230,118,.55)',true,'-80');
+    hLine(wrSer,-50,'rgba(255,255,255,.15)');
   }
-
-  if(ind==='rsi'){
+  else if(ind==='rsi'){
     const r=computeRSI(closes,14);
     const rs=sma(r,9);
-    const yc=v=>MT+PH*(1-v/100);
-    ctx.fillStyle='rgba(255,45,85,.08)';ctx.fillRect(ML,yc(70),PW,yc(100)-yc(70));
-    ctx.fillStyle='rgba(0,230,118,.08)';ctx.fillRect(ML,yc(30),PW,yc(0)-yc(30));
-    hLine(yc(70),'rgba(255,45,85,.4)');hLine(yc(30),'rgba(0,230,118,.4)');hLine(yc(50),'rgba(255,255,255,.15)',[]);
-    [[r,'#ffffff',2],[rs,'#ff9800',1.5]].forEach(([arr,col,lw])=>{
-      ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.setLineDash([]);let s=false;
-      arr.forEach((v,i)=>{if(v===null){s=false;return;}const y=yc(v);s?ctx.lineTo(xc(i),y):(ctx.moveTo(xc(i),y),s=true);});
-      ctx.stroke();
-    });
-    label('RSI 14 + SMOOTH 9','rgba(184,204,224,.6)',ML+4,MT+12);
-    ctx.fillStyle='rgba(184,204,224,.5)';ctx.textAlign='right';ctx.font='9px IBM Plex Mono';
-    ['100','70','50','30','0'].forEach(v=>{ctx.fillText(v,ML-4,yc(parseInt(v))+3);});
-    const lr=r[N-1],lrs=rs[N-1];
-    if(lr!==null){ctx.fillStyle='rgba(255,255,255,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(lr.toFixed(1),ML+PW+4,yc(lr)+3);}
-    if(lrs!==null){ctx.fillStyle='rgba(255,152,0,.9)';ctx.textAlign='left';ctx.font='bold 9px IBM Plex Mono';ctx.fillText(lrs.toFixed(1),ML+PW+4,yc(lrs)+3);}
+    const rSer=_momIndChart.addLineSeries({color:'#ffffff',lineWidth:2,priceLineVisible:false,lastValueVisible:true,title:'RSI'});
+    rSer.setData(r.map((v,i)=>toD(r,i)).filter(Boolean));
+    const sSer=_momIndChart.addLineSeries({color:'#ff9800',lineWidth:1.5,priceLineVisible:false,lastValueVisible:true,title:'Smo'});
+    sSer.setData(rs.map((v,i)=>toD(rs,i)).filter(Boolean));
+    _momIndSers=[rSer,sSer];
+    r.forEach((v,i)=>{if(v!==null&&!isNaN(v))_momIndDataMap.set(times[i],v);});
+    fixScale(rSer,0,100);
+    hLine(rSer,70,'rgba(255,45,85,.55)',true,'70');
+    hLine(rSer,30,'rgba(0,230,118,.55)',true,'30');
+    hLine(rSer,50,'rgba(255,255,255,.15)');
   }
 }
 
+// ── Price chart data (candles + MAs) ──────────────────────────────────────────
+function _momSetData(candles,ind){
+  if(!_momPriceChart||!candles.length)return;
+
+  _momCandleSer.setData(candles.map(c=>({
+    time:_momT(c.time), open:c.open, high:c.high, low:c.low, close:c.close,
+  })));
+
+  const closes=candles.map(c=>c.close);
+  _momMaSers.forEach(({period,ser})=>{
+    const vals=ema(closes,period);
+    ser.setData(vals.map((v,i)=>v!==null?{time:_momT(candles[i].time),value:v}:null).filter(Boolean));
+  });
+
+  _momSetIndData(candles,ind);
+  setTimeout(_momDrawBg,50); // after LWC renders
+}
+
+// ── Momentum background overlay (canvas over price chart) ─────────────────────
+function _momDrawBg(){
+  const cv=document.getElementById('momBgCanvas');
+  const pd=document.getElementById('momPriceDiv');
+  if(!cv||!pd||!_momPriceChart||!S.candles||!S.candles.length)return;
+  const W=pd.clientWidth, H=pd.clientHeight;
+  if(!W||!H)return;
+  cv.width=W; cv.height=H;
+  const ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  const ind=document.querySelector('input[name="momInd"]:checked')?.value||'macd';
+  const momentum=_momComputeDir(S.candles,ind);
+  const ts=_momPriceChart.timeScale();
+
+  for(let i=0;i<S.candles.length;i++){
+    const m=momentum[i];
+    if(!m)continue;
+    const t1=_momT(S.candles[i].time);
+    const t2=i+1<S.candles.length?_momT(S.candles[i+1].time):t1+1;
+    const x1=ts.timeToCoordinate(t1);
+    if(x1===null)continue;
+    const x2=i+1<S.candles.length?ts.timeToCoordinate(t2):null;
+    const xEnd=x2!==null?x2:x1+10;
+    if(x1>W||xEnd<0)continue;
+    ctx.fillStyle=m==='bull'?'rgba(0,230,118,.11)':'rgba(255,45,85,.10)';
+    ctx.fillRect(Math.max(0,x1),0,Math.min(xEnd,W)-Math.max(0,x1),H);
+  }
+}
+
+// ── Main redraw entry point ───────────────────────────────────────────────────
 function _momRedraw(){
   if(!S.candles||!S.candles.length)return;
   const ind=document.querySelector('input[name="momInd"]:checked')?.value||'macd';
-  const momentum=_momComputeDir(S.candles,ind);
-  _momDrawPrice(S.candles,momentum);
-  _momDrawInd(S.candles,ind);
+  if(!_momInitDone){if(!_momInitCharts())return;}
+  _momSetData(S.candles,ind);
 }
-// Auto-refresh quand de nouvelles données arrivent (WS live)
-const _origRenderAll=typeof renderAll==='function'?renderAll:null;
-// Hook dans le WS chartWs : on redessine aussi si l'onglet momentum est actif
+
+// Hook: appelé par le WS live si l'onglet momentum est actif
 const _momCheckTab=()=>{if(document.getElementById('mainTabMomentum')?.classList.contains('active'))_momRedraw();};
 </script>
 </body>
